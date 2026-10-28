@@ -28,6 +28,12 @@ CREATE TABLE IF NOT EXISTS panels(id BIGSERIAL PRIMARY KEY, guild_id TEXT, kind 
   options TEXT DEFAULT '[]', forms TEXT DEFAULT '[]', channel_id TEXT, message_id TEXT);
 ALTER TABLE settings ADD COLUMN IF NOT EXISTS ticket_log TEXT;
 ALTER TABLE settings ADD COLUMN IF NOT EXISTS app_log TEXT;
+ALTER TABLE panels ADD COLUMN IF NOT EXISTS ticket_category TEXT;
+ALTER TABLE panels ADD COLUMN IF NOT EXISTS support_role TEXT;
+ALTER TABLE panels ADD COLUMN IF NOT EXISTS ticket_log TEXT;
+ALTER TABLE panels ADD COLUMN IF NOT EXISTS welcome TEXT;
+ALTER TABLE panels ADD COLUMN IF NOT EXISTS entry_desc TEXT;
+ALTER TABLE panels ADD COLUMN IF NOT EXISTS members TEXT DEFAULT '[]';
 """
 
 web = Quart(__name__)
@@ -216,10 +222,11 @@ pv.textContent='';var m=el('div','m'),b=el('div'),emb=el('div','emb');emb.style.
 if(title)emb.appendChild(el('b',0,title));if(desc){var p=el('p',0,desc);p.style.whiteSpace='pre-wrap';emb.appendChild(p)}
 b.appendChild(el('b',0,'Support bot'));b.appendChild(emb);
 if(kind==='ticket'){labels=$$('input[name=opt_label]').map(function(i){return i.value.trim()}).filter(Boolean);if(!labels.length)labels=['Create ticket'];ph=ph||'Select a ticket type'}
+else if(kind==='multi'){labels=$$('input[name=members]:checked').map(function(i){return i.dataset.name});ph=ph||'Choose a topic'}
 else if(st==='menu'){labels=[$('#f-btn').value.trim()||'Apply']}
 else{var c=$$('input[name=forms]:checked');if(!c.length)c=$$('input[name=forms]').filter(function(i){return i.dataset.open==='1'});labels=c.map(function(i){return i.dataset.name});ph=ph||'Choose a form'}
 if(st==='dropdown'){var d=el('div','dsel');d.appendChild(el('span',0,ph));d.appendChild(el('span',0,'\u25be'));b.appendChild(d)}
-else{var r=el('div','dbtns');labels.forEach(function(l){r.appendChild(el('span','dbtn'+(kind==='apply'?' g':''),l))});if(!labels.length)r.appendChild(el('span','hint','No open forms yet'));b.appendChild(r)}
+else{var r=el('div','dbtns');labels.forEach(function(l){r.appendChild(el('span','dbtn'+(kind==='apply'?' g':''),l))});if(!labels.length)r.appendChild(el('span','hint',kind==='multi'?'Pick at least one ticket panel':'No open forms yet'));b.appendChild(r)}
 m.appendChild(el('div','a','S'));m.appendChild(b);pv.appendChild(m)}
 var os=$('#opts'),ao=$('#addo'),oc=$('#oc');
 function ocount(){if(oc)oc.textContent=$$('.qrow:not(.gone)',os).length+' of 25 types'}
@@ -329,16 +336,21 @@ async def guild_page(gid, gname):
 <nav class=tabs role=tablist><button data-t=tickets role=tab>Tickets</button><button data-t=apps role=tab>Applications{% if pending %}<span class=badge>{{ pending }}</span>{% endif %}</button><i></i></nav>
 
 <section class=pane id=p-tickets><div class=cols>
- <div class=panel><h2>Ticket settings</h2><p class=lead>Choose where new tickets appear and who can see them.</p>
+ <div class=panel><h2>Ticket settings</h2><p class=lead>Defaults for every ticket panel. Each panel can override them in its own settings.</p>
   <form method=post action="/g/{{ gid }}/tickets"><input type=hidden name=csrf value="{{ session.csrf }}">
    <label for=cat>Ticket category</label><select id=cat name=ticket_category>{{ opts(cats, s.ticket_category) }}</select>
    <label for=role>Support role</label><select id=role name=support_role>{{ opts(roles, s.support_role) }}</select>
    <label for=tlog>Log channel</label><select id=tlog name=ticket_log>{{ opts(text, s.ticket_log) }}</select>
    <p class=hint>Tickets open under <b id=pvcat>no category</b> and are visible to <b id=pvrole>only the ticket owner</b>. Opened and closed tickets are logged in <b id=pvtlog>no channel</b>.</p>
    <p style="margin:22px 0 0"><button class=btn>Save settings</button></p></form></div>
- <div class=panel><h2>Ticket panels</h2><p class=lead>Choose buttons or a dropdown and edit every text.</p>
+ <div class=stack>
+ <div class=panel><h2>Ticket panels</h2><p class=lead>Each panel has its own message, ticket types, category, support role and log channel.</p>
   <div class=rows>{% for p in tpanels %}{{ prow(p) }}{% else %}<div class=empty>No panels yet. Create one to let members open tickets.</div>{% endfor %}</div>
   <p style="margin:22px 0 0"><a class=btn href="/g/{{ gid }}/panel/new?kind=ticket">New ticket panel</a></p></div>
+ <div class=panel><h2>Multi panels</h2><p class=lead>Combine several ticket panels into one message, for example a dropdown where every entry opens a different kind of ticket.</p>
+  <div class=rows>{% for p in mpanels %}{{ prow(p) }}{% else %}<div class=empty>No multi panels yet. Create at least one ticket panel first, then combine them here.</div>{% endfor %}</div>
+  <p style="margin:22px 0 0"><a class="btn {{ '' if tpanels else 'ghost' }}" href="/g/{{ gid }}/panel/new?kind=multi">New multi panel</a></p></div>
+ </div>
 </div></section>
 
 <section class=pane id=p-apps hidden><div class=stack>
@@ -369,7 +381,7 @@ async def guild_page(gid, gname):
   <div class=rows>{% for p in apanels %}{{ prow(p) }}{% else %}<div class=empty>No panels yet. Create one to let members apply.</div>{% endfor %}</div>
   <p style="margin:22px 0 0"><a class=btn href="/g/{{ gid }}/panel/new?kind=apply">New application panel</a></p></div>
 </div></section>""", gname=gname, gid=gid, s=s, forms=forms, pending=pending, text=text, cats=cats, roles=roles,
-        tpanels=[p for p in panels if p["kind"] == "ticket"], apanels=[p for p in panels if p["kind"] == "apply"], chn=chn, styles=STYLE_NAMES)
+        tpanels=[p for p in panels if p["kind"] == "ticket"], apanels=[p for p in panels if p["kind"] == "apply"], mpanels=[p for p in panels if p["kind"] == "multi"], chn=chn, styles=STYLE_NAMES)
 
 @web.post("/g/<gid>/tickets")
 @guild_route
@@ -420,14 +432,19 @@ async def form_action(gid, gname, fid, action):
     return redirect(f"/g/{gid}#apps")
 
 STYLE_NAMES = {"button": "Buttons", "dropdown": "Dropdown", "menu": "Single button", "buttons": "Button per form"}
-STYLES = {"ticket": ["button", "dropdown"], "apply": ["menu", "buttons", "dropdown"]}
+STYLES = {"ticket": ["button", "dropdown"], "apply": ["menu", "buttons", "dropdown"], "multi": ["dropdown", "button"]}
 
 def default_panel(kind):
+    base = dict(id=None, kind=kind, button_label="", placeholder="", options=[], forms=[], members=[], channel_id=None,
+                ticket_category=None, support_role=None, ticket_log=None, welcome="", entry_desc="")
     if kind == "apply":
-        return dict(id=None, kind="apply", name="Application panel", style="menu", title="Applications", description="Click the button below to apply.",
-                    color="#57F287", button_label="Apply", placeholder="Choose a form", options=[], forms=[], channel_id=None)
-    return dict(id=None, kind="ticket", name="Support panel", style="button", title="Support", description="Click the button below to open a ticket.",
-                color="#5865F2", button_label="", placeholder="Select a ticket type", options=[{"label": "Create ticket", "desc": ""}], forms=[], channel_id=None)
+        return dict(base, name="Application panel", style="menu", title="Applications", description="Click the button below to apply.",
+                    color="#57F287", button_label="Apply", placeholder="Choose a form")
+    if kind == "multi":
+        return dict(base, name="Multi panel", style="dropdown", title="Support", description="Choose the kind of help you need.",
+                    color="#5865F2", placeholder="Choose a topic")
+    return dict(base, name="Support panel", style="button", title="Support", description="Click the button below to open a ticket.",
+                color="#5865F2", placeholder="Select a ticket type", options=[{"label": "Create ticket", "desc": ""}])
 
 def chunk(btns):
     return [{"type": 1, "components": btns[n:n + 5]} for n in range(0, len(btns), 5)]
@@ -444,6 +461,16 @@ async def build_payload(gid, p):
                       "options": [dict(label=o["label"], value=str(n), **({"description": o["desc"]} if o.get("desc") else {})) for n, o in enumerate(opts)]}]}]
         else:
             comps = chunk([{"type": 2, "style": 1, "label": o["label"], "custom_id": f"tk:b:{p['id']}:{n}"} for n, o in enumerate(opts)])
+    elif p["kind"] == "multi":
+        ids = [int(x) for x in json.loads(p["members"] or "[]")]
+        rows = [r for r in await db("SELECT id,name,button_label,entry_desc FROM panels WHERE guild_id=$1 AND kind='ticket' ORDER BY id", gid) if r["id"] in ids][:25]
+        if not rows: return None
+        ents = [(r["id"], (r["button_label"] or r["name"])[:80], (r["entry_desc"] or "")[:100]) for r in rows]
+        if p["style"] == "dropdown":
+            comps = [{"type": 1, "components": [{"type": 3, "custom_id": f"mp:s:{p['id']}", "placeholder": p["placeholder"] or "Choose a topic",
+                      "options": [dict(label=l, value=str(mid), **({"description": d} if d else {})) for mid, l, d in ents]}]}]
+        else:
+            comps = chunk([{"type": 2, "style": 1, "label": l, "custom_id": f"mp:b:{p['id']}:{mid}"} for mid, l, d in ents])
     elif p["style"] == "menu":
         comps = chunk([{"type": 2, "style": 3, "label": p["button_label"] or "Apply", "custom_id": f"ap:m:{p['id']}"}])
     else:
@@ -461,7 +488,7 @@ async def publish_panel(gid, pid):
     p = dict(await db("SELECT * FROM panels WHERE id=$1 AND guild_id=$2", pid, gid, mode="fetchrow"))
     if not p["channel_id"]: return "Saved. Choose a channel to publish the panel."
     payload = await build_payload(gid, p)
-    if payload is None: return "Saved, but there are no open forms to show yet. Create a form first."
+    if payload is None: return "Saved, but pick at least one ticket panel first." if p["kind"] == "multi" else "Saved, but there are no open forms to show yet. Create a form first."
     st = None
     if p["message_id"]:
         st, _ = await dapi("PATCH", f"/channels/{p['channel_id']}/messages/{p['message_id']}", json=payload)
@@ -475,18 +502,20 @@ async def publish_panel(gid, pid):
 @web.route("/g/<gid>/panel/<pid>")
 @guild_route
 async def panel_edit(gid, gname, pid):
-    text, _, _ = await gdata(gid)
+    text, cats, roles = await gdata(gid)
     if pid == "new":
-        p = default_panel("apply" if request.args.get("kind") == "apply" else "ticket")
+        p = default_panel(request.args.get("kind") if request.args.get("kind") in ("apply", "multi") else "ticket")
     else:
         row = await db("SELECT * FROM panels WHERE id=$1 AND guild_id=$2", int(pid) if pid.isdigit() else 0, gid, mode="fetchrow")
         if not row: abort(404)
         p = dict(row)
         p["options"] = json.loads(p["options"] or "[]") or ([{"label": "Create ticket", "desc": ""}] if p["kind"] == "ticket" else [])
         p["forms"] = [int(x) for x in json.loads(p["forms"] or "[]")]
+        p["members"] = [int(x) for x in json.loads(p["members"] or "[]")]
     forms = [dict(r) for r in await db("SELECT id,name,open FROM forms WHERE guild_id=$1 ORDER BY id", gid)]
+    tickets = [dict(r) for r in await db("SELECT id,name,button_label,entry_desc FROM panels WHERE guild_id=$1 AND kind='ticket' ORDER BY id", gid)]
     return await page("""<a class=back href="/g/{{ gid }}{{ '#apps' if p.kind == 'apply' else '' }}">&larr; Back to {{ gname }}</a>
-<div class=head><h1>{{ 'Edit' if p.id else 'New' }} {{ 'ticket' if p.kind == 'ticket' else 'application' }} panel</h1></div>
+<div class=head><h1>{{ 'Edit' if p.id else 'New' }} {{ {'ticket': 'ticket', 'apply': 'application', 'multi': 'multi'}[p.kind] }} panel</h1></div>
 <form method=post action="/g/{{ gid }}/panel/save"><input type=hidden name=csrf value="{{ session.csrf }}"><input type=hidden name=kind value="{{ p.kind }}"><input type=hidden name=pid value="{{ p.id or '' }}">
 <div class=cols><div class=stack>
  <div class=panel><h2>Message</h2><p class=lead>The text and color of the message members see.</p>
@@ -494,12 +523,17 @@ async def panel_edit(gid, gname, pid):
   <label for=f-title>Title</label><input id=f-title name=title maxlength=200 value="{{ p.title }}">
   <label for=f-desc>Description</label><textarea id=f-desc name=description rows=4 maxlength=2000>{{ p.description }}</textarea>
   <label for=f-color>Accent color</label><input id=f-color type=color name=color value="{{ p.color }}"></div>
- <div class=panel><h2>Style</h2><p class=lead>How members {{ 'open a ticket' if p.kind == 'ticket' else 'start an application' }}.</p>
+ <div class=panel><h2>Style</h2><p class=lead>How members {{ 'start an application' if p.kind == 'apply' else 'open a ticket' }}.</p>
   <div class=seg style="margin-top:14px">{% for v in styles_for %}<label><input type=radio name=style value="{{ v }}" {{ 'checked' if p.style == v }}><span>{{ names[v] }}</span></label>{% endfor %}</div>
   {% if p.kind == 'ticket' %}
   <label>Ticket types</label><div id=opts>{% for o in p.options %}<div class=qrow><input name=opt_label maxlength=80 placeholder="Label" aria-label="Label" value="{{ o.label }}"><input name=opt_desc maxlength=100 placeholder="Description (dropdown only)" aria-label="Description" value="{{ o.desc }}"><button type=button class=x aria-label="Remove type">&times;</button></div>{% endfor %}</div>
   <div class=split><span id=oc></span><button type=button id=addo class="btn ghost sm">Add ticket type</button></div>
   <p class=hint>Each type becomes its own button or dropdown entry, and its name is used for the ticket channel.</p>
+  {% elif p.kind == 'multi' %}
+  <label>Ticket panels to include</label>
+  {% for t in tickets %}<label class=chk><input type=checkbox name=members value="{{ t.id }}" data-name="{{ t.button_label or t.name }}" {{ 'checked' if t.id in p.members }}><span>{{ t.button_label or t.name }}{% if t.entry_desc %} <small style="color:var(--mute)">{{ t.entry_desc }}</small>{% endif %}</span></label>
+  {% else %}<div class=empty>No ticket panels yet. Create ticket panels first, then combine them here.</div>{% endfor %}
+  <p class=hint>Each ticket panel becomes one entry and keeps its own category, support role, log channel and welcome message. After you rename or add ticket panels, publish this panel again.</p>
   {% else %}
   <div data-for=menu><label for=f-btn>Button text</label><input id=f-btn name=button_label maxlength=80 value="{{ p.button_label }}"></div>
   <label>Forms to include</label>
@@ -508,29 +542,41 @@ async def panel_edit(gid, gname, pid):
   <p class=hint>Leave all unchecked to include every open form. The button per form uses the form name as its text.</p>
   {% endif %}
   <div data-for=dropdown><label for=f-ph>Dropdown placeholder</label><input id=f-ph name=placeholder maxlength=100 value="{{ p.placeholder }}"></div></div>
+ {% if p.kind == 'ticket' %}<div class=panel><h2>Ticket settings</h2><p class=lead>Tickets from this panel use these settings. Fields left on none use the server defaults from the Tickets tab.</p>
+  <label for=t-cat>Ticket category</label><select id=t-cat name=ticket_category>{{ opts(cats, p.ticket_category) }}</select>
+  <label for=t-role>Support role</label><select id=t-role name=support_role>{{ opts(roles, p.support_role) }}</select>
+  <label for=t-log>Log channel</label><select id=t-log name=ticket_log>{{ opts(text, p.ticket_log) }}</select>
+  <label for=t-wel>Welcome message</label><textarea id=t-wel name=welcome rows=3 maxlength=1000 placeholder="Describe your issue and we will help. Write {user} to mention the member.">{{ p.welcome or '' }}</textarea>
+  <label for=f-entry>Name in multi panels</label><input id=f-entry name=button_label maxlength=80 value="{{ p.button_label or '' }}" placeholder="{{ p.name }}">
+  <label for=f-edesc>Description in multi panels</label><input id=f-edesc name=entry_desc maxlength=100 value="{{ p.entry_desc or '' }}" placeholder="Shown under the entry in a dropdown"></div>{% endif %}
  <div class=panel><h2>Publish</h2><p class=lead>Publishing sends the message, or updates it if it is already posted.</p>
   <label for=f-ch>Channel</label><select id=f-ch name=channel>{{ opts(text, p.channel_id) }}</select>
   <p style="margin:22px 0 0;display:flex;gap:10px;flex-wrap:wrap"><button class="btn ghost" name=do value=save>Save</button><button class=btn name=do value=publish>Save and publish</button></p></div>
 </div>
 <div class="panel stick"><h2>Preview</h2><p class=lead>Updates as you type.</p><div class=dc id=pv data-kind="{{ p.kind }}" style="margin-top:18px"></div></div>
-</div></form>""", gname=gname, gid=gid, p=p, forms=forms, text=text, styles_for=STYLES[p["kind"]], names=STYLE_NAMES)
+</div></form>""", gname=gname, gid=gid, p=p, forms=forms, text=text, styles_for=STYLES[p["kind"]], names=STYLE_NAMES, cats=cats, roles=roles, tickets=tickets)
 
 @web.post("/g/<gid>/panel/save")
 @guild_route
 async def panel_save(gid, gname):
     f = await request.form
-    text, _, _ = await gdata(gid)
-    kind = "apply" if f.get("kind") == "apply" else "ticket"
+    text, cats, roles = await gdata(gid)
+    kind = f.get("kind") if f.get("kind") in ("apply", "multi") else "ticket"
     style = f.get("style") if f.get("style") in STYLES[kind] else STYLES[kind][0]
     color = f.get("color", "") if re.fullmatch(r"#[0-9a-fA-F]{6}", f.get("color", "")) else "#5865F2"
     labels, descs = f.getlist("opt_label"), f.getlist("opt_desc")
     options = [{"label": l.strip()[:80], "desc": (descs[n] if n < len(descs) else "").strip()[:100]} for n, l in enumerate(labels) if l.strip()][:25] if kind == "ticket" else []
     if kind == "ticket" and not options: options = [{"label": "Create ticket", "desc": ""}]
     valid = {r["id"] for r in await db("SELECT id FROM forms WHERE guild_id=$1", gid)}
-    fids = [int(x) for x in f.getlist("forms") if x.isdigit() and int(x) in valid][:25]
-    channel = f.get("channel") if f.get("channel") in {c["id"] for c in text} else None
+    fids = [int(x) for x in f.getlist("forms") if x.isdigit() and int(x) in valid][:25] if kind == "apply" else []
+    tids = {r["id"] for r in await db("SELECT id FROM panels WHERE guild_id=$1 AND kind='ticket'", gid)}
+    members = [int(x) for x in f.getlist("members") if x.isdigit() and int(x) in tids][:25] if kind == "multi" else []
+    pick = lambda key, items: f.get(key) if f.get(key) in {c["id"] for c in items} else None
+    channel = pick("channel", text)
+    tcat, trole, tlog = (pick("ticket_category", cats), pick("support_role", roles), pick("ticket_log", text)) if kind == "ticket" else (None, None, None)
     vals = ((f.get("name") or "").strip()[:60] or "Untitled panel", style, f.get("title", "").strip()[:200], f.get("description", "").strip()[:2000], color,
-            f.get("button_label", "").strip()[:80], f.get("placeholder", "").strip()[:100], json.dumps(options), json.dumps(fids), channel)
+            f.get("button_label", "").strip()[:80], f.get("placeholder", "").strip()[:100], json.dumps(options), json.dumps(fids), channel,
+            tcat, trole, tlog, f.get("welcome", "").strip()[:1000], f.get("entry_desc", "").strip()[:100], json.dumps(members))
     pid = int(f["pid"]) if f.get("pid", "").isdigit() else None
     old = await db("SELECT * FROM panels WHERE id=$1 AND guild_id=$2", pid, gid, mode="fetchrow") if pid else None
     if pid and not old: abort(404)
@@ -538,11 +584,12 @@ async def panel_save(gid, gname):
         if old["message_id"] and old["channel_id"] != channel:  # moved to another channel: remove the old message
             await dapi("DELETE", f"/channels/{old['channel_id']}/messages/{old['message_id']}")
             await db("UPDATE panels SET message_id=NULL WHERE id=$1", pid, mode="execute")
-        await db("""UPDATE panels SET name=$1,style=$2,title=$3,description=$4,color=$5,button_label=$6,placeholder=$7,options=$8,forms=$9,channel_id=$10
-                    WHERE id=$11 AND guild_id=$12""", *vals, pid, gid, mode="execute")
+        await db("""UPDATE panels SET name=$1,style=$2,title=$3,description=$4,color=$5,button_label=$6,placeholder=$7,options=$8,forms=$9,channel_id=$10,
+                    ticket_category=$11,support_role=$12,ticket_log=$13,welcome=$14,entry_desc=$15,members=$16 WHERE id=$17 AND guild_id=$18""", *vals, pid, gid, mode="execute")
     else:
-        pid = await db("""INSERT INTO panels(name,style,title,description,color,button_label,placeholder,options,forms,channel_id,guild_id,kind)
-                          VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) RETURNING id""", *vals, gid, kind, mode="fetchval")
+        pid = await db("""INSERT INTO panels(name,style,title,description,color,button_label,placeholder,options,forms,channel_id,
+                          ticket_category,support_role,ticket_log,welcome,entry_desc,members,guild_id,kind)
+                          VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18) RETURNING id""", *vals, gid, kind, mode="fetchval")
     session["msg"] = await publish_panel(gid, pid) if f.get("do") == "publish" else "Panel saved."
     return redirect(f"/g/{gid}/panel/{pid}")
 
