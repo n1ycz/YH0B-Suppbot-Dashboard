@@ -1,12 +1,12 @@
-import os, re, json, time, secrets
-from datetime import timedelta
+import asyncio, csv, io, os, re, json, time, secrets
+from datetime import datetime, timedelta, timezone
 from functools import wraps
 from urllib.parse import urlencode, urlsplit, urlunsplit, parse_qsl
 
 import aiohttp, asyncpg
 from dotenv import load_dotenv
 from markupsafe import Markup, escape
-from quart import Quart, request, session, redirect, render_template_string, abort
+from quart import Quart, Response, request, session, redirect, render_template_string, abort
 
 load_dotenv()
 TOKEN, CLIENT_ID, CLIENT_SECRET = os.environ["DISCORD_TOKEN"], os.environ["CLIENT_ID"], os.environ["CLIENT_SECRET"]
@@ -34,6 +34,21 @@ ALTER TABLE panels ADD COLUMN IF NOT EXISTS ticket_log TEXT;
 ALTER TABLE panels ADD COLUMN IF NOT EXISTS welcome TEXT;
 ALTER TABLE panels ADD COLUMN IF NOT EXISTS entry_desc TEXT;
 ALTER TABLE panels ADD COLUMN IF NOT EXISTS members TEXT DEFAULT '[]';
+CREATE TABLE IF NOT EXISTS tickets(id BIGSERIAL PRIMARY KEY, guild_id TEXT, num INT, channel_id TEXT, user_id TEXT, user_name TEXT,
+  panel_id BIGINT DEFAULT 0, label TEXT, status TEXT DEFAULT 'open', opened_at TIMESTAMPTZ DEFAULT now(), closed_at TIMESTAMPTZ, closed_by TEXT);
+CREATE TABLE IF NOT EXISTS blacklist(guild_id TEXT, user_id TEXT, reason TEXT, PRIMARY KEY(guild_id, user_id));
+ALTER TABLE settings ADD COLUMN IF NOT EXISTS transcripts TEXT DEFAULT 'log';
+ALTER TABLE forms ADD COLUMN IF NOT EXISTS cooldown_hours INT DEFAULT 0;
+ALTER TABLE forms ADD COLUMN IF NOT EXISTS required_role TEXT;
+ALTER TABLE forms ADD COLUMN IF NOT EXISTS accept_msg TEXT;
+ALTER TABLE forms ADD COLUMN IF NOT EXISTS deny_msg TEXT;
+ALTER TABLE apps ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT now();
+ALTER TABLE apps ADD COLUMN IF NOT EXISTS user_name TEXT;
+ALTER TABLE apps ADD COLUMN IF NOT EXISTS reviewer TEXT;
+ALTER TABLE apps ADD COLUMN IF NOT EXISTS reviewed_at TIMESTAMPTZ;
+ALTER TABLE panels ADD COLUMN IF NOT EXISTS image_url TEXT;
+ALTER TABLE panels ADD COLUMN IF NOT EXISTS footer TEXT;
+ALTER TABLE panels ADD COLUMN IF NOT EXISTS button_color TEXT;
 """
 
 web = Quart(__name__)
@@ -62,10 +77,13 @@ async def dapi(method, path, **kw):
         return r.status, data
 
 _cache = {"t": 0, "ids": set()}
+ICONS, USERS = {}, {}
 async def bot_guild_ids():
     if time.time() - _cache["t"] > 60:
         st, d = await dapi("GET", "/users/@me/guilds?limit=200")
-        if st == 200: _cache.update(t=time.time(), ids={g["id"] for g in d})
+        if st == 200:
+            _cache.update(t=time.time(), ids={g["id"] for g in d})
+            ICONS.update({g["id"]: g.get("icon") for g in d})
     return _cache["ids"]
 
 async def gdata(gid):
@@ -76,6 +94,29 @@ async def gdata(gid):
     cats = [{"id": c["id"], "name": c["name"]} for c in ch if c["type"] == 4]
     roles = [{"id": r["id"], "name": r["name"]} for r in sorted(ro, key=lambda r: -r["position"]) if r["id"] != gid and not r.get("managed")]
     return text, cats, roles
+
+def ago(dt):
+    if not dt: return ""
+    sec = int((datetime.now(timezone.utc) - dt).total_seconds())
+    for n, u in ((86400, "d"), (3600, "h"), (60, "m")):
+        if sec >= n: return f"{sec // n}{u} ago"
+    return "just now"
+web.jinja_env.globals.update(ago=ago)
+
+async def uname(uid):
+    if uid not in USERS:
+        st, d = await dapi("GET", f"/users/{uid}")
+        USERS[uid] = (d.get("global_name") or d.get("username")) if st == 200 and isinstance(d, dict) else None
+    return USERS[uid]
+
+def icon(path): return Markup(f'<svg viewBox="0 0 24 24" width=22 height=22 fill=none stroke=currentColor stroke-width=1.8 stroke-linecap=round stroke-linejoin=round>{path}</svg>')
+ICO = {"ticket": icon('<path d="M4 8a2 2 0 0 0 0 8v2a1 1 0 0 0 1 1h14a1 1 0 0 0 1-1v-2a2 2 0 0 1 0-8V6a1 1 0 0 0-1-1H5a1 1 0 0 0-1 1z"/><path d="M14 5v14" stroke-dasharray="2 3"/>'),
+       "trend": icon('<path d="M3 17l6-6 4 4 8-8"/><path d="M15 7h6v6"/>'), "clock": icon('<circle cx=12 cy=12 r=9 /><path d="M12 7v5l3 2"/>'),
+       "inbox": icon('<path d="M4 13l2-7h12l2 7v5H4z"/><path d="M4 13h5l1 2h4l1-2h5"/>')}
+SERIES_SQL = """SELECT g::date AS day,
+ (SELECT COUNT(*) FROM tickets t WHERE t.guild_id=$1 AND t.opened_at::date=g::date) AS t,
+ (SELECT COUNT(*) FROM apps a WHERE a.guild_id=$1 AND a.created_at::date=g::date) AS a
+ FROM generate_series(current_date-13, current_date, interval '1 day') g"""
 
 async def db(sql, *a, mode="fetch"):
     for n in range(2):
@@ -177,27 +218,59 @@ a.tile:hover{transform:translateY(-4px);box-shadow:inset 0 1px 0 rgba(255,255,25
 .seg span:hover{background:rgba(255,255,255,.09)}.seg input:checked+span{background:linear-gradient(135deg,#6f7dff,#9a6bff);border-color:transparent;box-shadow:inset 0 1px 0 rgba(255,255,255,.3),0 6px 20px -4px rgba(111,125,255,.6);color:#fff}
 .seg input:focus-visible+span{outline:2px solid var(--ok);outline-offset:3px}
 .chk{display:flex;align-items:center;gap:10px;margin:8px 0;color:var(--text);font-size:15px;cursor:pointer}.chk input{width:18px;height:18px;padding:0;accent-color:#7c8cff}
+.me{width:30px;height:30px;border-radius:50%;object-fit:cover;border:1px solid var(--edge)}
+body{transition:opacity .2s}body.leaving{opacity:0}
+.toast{overflow:hidden}.toast::after{content:"";position:absolute;left:0;bottom:0;height:3px;background:var(--ok);animation:life 4.2s linear forwards}
+.search{max-width:380px;margin-top:22px}.tile[hidden]{display:none}
+.ava{overflow:hidden}.ava img{width:100%;height:100%;object-fit:cover}.hico{width:52px;height:52px;border-radius:16px;object-fit:cover}
+.stats{display:grid;grid-template-columns:repeat(4,1fr);gap:16px;margin-bottom:24px}
+.panel.stat{padding:20px 22px;display:flex;flex-direction:column;gap:2px}.stat b{font:700 38px 'Bricolage Grotesque',sans-serif;letter-spacing:-.03em;line-height:1.1}.stat span{color:var(--mute);font-size:14px}
+.ico{width:42px;height:42px;border-radius:13px;display:grid;place-items:center;margin-bottom:10px;color:#fff;background:linear-gradient(135deg,#6f7dff,#9a6bff);box-shadow:inset 0 1px 0 rgba(255,255,255,.3),0 8px 20px -6px rgba(111,125,255,.6)}
+.stat:nth-child(2) .ico{background:linear-gradient(135deg,#2fd1a6,#18a58a)}.stat:nth-child(3) .ico{background:linear-gradient(135deg,#ffb84d,#ff8a4d)}.stat:nth-child(4) .ico{background:linear-gradient(135deg,#ff7aa8,#c05cff)}
+.cols2{display:grid;grid-template-columns:1.35fr 1fr;gap:24px;align-items:start}
+.setup{margin-bottom:24px}.prog{height:8px;border-radius:9px;background:rgba(255,255,255,.08);overflow:hidden;margin:14px 0 18px}.prog i{display:block;height:100%;background:linear-gradient(90deg,#6f7dff,#3ddbb0);border-radius:inherit;animation:fill 1.2s var(--ease) both}
+.steps{display:flex;flex-wrap:wrap;gap:8px}.step{display:inline-flex;gap:8px;align-items:center;padding:8px 14px 8px 10px;border-radius:99px;border:1px solid var(--edge);text-decoration:none;font-size:14px;background:rgba(255,255,255,.03);transition:background .25s,border-color .25s}
+.step:hover{background:rgba(255,255,255,.09);border-color:rgba(124,140,255,.5)}.step.done{color:var(--mute)}.step.done span:last-child{text-decoration:line-through}
+.tick{width:18px;height:18px;border-radius:50%;border:1.5px solid var(--mute);display:grid;place-items:center;font-size:11px;font-weight:700}.done .tick{background:var(--ok);border-color:var(--ok);color:#06231c}
+.chart{display:flex;gap:6px;height:170px;margin-top:22px}.day{flex:1;display:flex;flex-direction:column;align-items:center;gap:6px;height:100%}
+.bars{flex:1;width:100%;display:flex;gap:3px;align-items:flex-end;border-bottom:1px solid var(--edge)}
+.bars i{flex:1;border-radius:4px 4px 0 0;transform-origin:bottom;animation:grow .9s var(--ease) both;animation-delay:calc(var(--n)*35ms + 250ms)}
+.b1{background:linear-gradient(180deg,#8f9bff,#5b6bff)}.b2{background:linear-gradient(180deg,#5fe8c4,#1fb994)}.day small{color:var(--mute);font-size:11px}
+.legend{display:flex;gap:14px;align-items:center;color:var(--mute);font-size:13px}.legend i{display:inline-block;width:10px;height:10px;border-radius:3px;margin-right:6px}.legend .b1,.legend .b2{border-radius:3px}
+.feed{margin-top:8px}.ev{display:flex;gap:12px;align-items:center;padding:11px 0;border-bottom:1px solid rgba(255,255,255,.06)}.ev:last-child{border:0}
+.ev div{min-width:0;font-size:15px}.ev small{display:block;color:var(--mute);font-size:13px}.dot{flex:none;width:9px;height:9px;border-radius:50%;background:#7c8cff;box-shadow:0 0 12px #7c8cff}.dot.application{background:var(--ok);box-shadow:0 0 12px var(--ok)}
+.chip{margin-left:auto;flex:none;padding:3px 11px;border-radius:99px;font-size:12px;font-weight:600;background:rgba(255,255,255,.08);color:var(--mute);text-transform:capitalize}
+.chip.open,.chip.pending{background:rgba(255,200,87,.14);color:#ffc857}.chip.accepted{background:rgba(61,219,176,.14);color:var(--ok)}.chip.denied{background:rgba(255,107,129,.14);color:var(--bad)}
+.bar{position:fixed;left:50%;bottom:20px;transform:translateX(-50%);z-index:8;display:flex;gap:10px;align-items:center;padding:10px 12px 10px 20px;border-radius:18px;background:rgba(18,21,46,.74);-webkit-backdrop-filter:blur(20px);backdrop-filter:blur(20px);border:1px solid var(--edge);box-shadow:0 24px 60px -12px rgba(0,0,0,.7);animation:rise .6s var(--ease) both;animation-delay:.2s}
+.dirtymsg{color:#ffc857;font-size:14px;opacity:0;transition:opacity .3s;margin-right:6px}.dirty .dirtymsg{opacity:1}
+.filters{display:flex;flex-wrap:wrap;gap:10px;margin:20px 0 6px;align-items:end}.filters>*{flex:1;min-width:150px;margin:0}.filters .btn{flex:none;min-width:0}
+.app{border:1px solid rgba(255,255,255,.08);border-radius:16px;background:rgba(255,255,255,.04);margin-top:10px;overflow:hidden;transition:border-color .3s,background .3s}
+.app:hover{background:rgba(255,255,255,.06)}.app[open]{border-color:rgba(124,140,255,.45)}.app summary{display:flex;align-items:center;gap:12px;padding:14px 16px;cursor:pointer;list-style:none}.app summary::-webkit-details-marker{display:none}
+.app summary div{flex:1;min-width:0}.app summary small{display:block;color:var(--mute)}.qa{padding:0 18px 18px;margin:0}.qa dt{color:var(--mute);font-size:13px;margin-top:14px}.qa dd{margin:4px 0 0;white-space:pre-wrap}
+.pimg{display:block;max-width:100%;border-radius:4px;margin-top:8px}.pft{display:block;color:#949ba4;margin-top:8px;font-size:12px}.dbtn.b2{background:#4e5058}.dbtn.r{background:#da373c}
+.inline{display:flex;gap:10px}.inline>*{margin:0}.inline input:first-child{flex:1}
+@keyframes grow{from{transform:scaleY(0)}}@keyframes fill{from{width:0}}@keyframes life{from{width:100%}to{width:0}}
 @keyframes drift{to{transform:translate3d(8vw,6vh,0) scale(1.12)}}@keyframes grid{to{background-position:0 56px,56px 0}}
 @keyframes rise{from{opacity:0;transform:translateY(14px)}}@keyframes pop{from{opacity:0;transform:translateY(10px)}}@keyframes fade{from{opacity:0}}
 @keyframes spin{to{transform:rotate(1turn)}}@keyframes float{50%{transform:translateY(-6px)}}@keyframes rip{to{transform:scale(2.6);opacity:0}}
 @keyframes toast{from{opacity:0;transform:translateY(14px)}}@keyframes rowin{from{opacity:0;transform:translateY(-6px)}}@keyframes rowout{to{opacity:0;transform:translateX(14px);height:0;margin:0}}
-@media(max-width:820px){.stick{position:static}.hero,.cols,.pair{grid-template-columns:1fr}.hero{padding-top:16px;gap:36px}.cols>.panel+.panel{position:static}.bg i{filter:blur(60px)}.glow{display:none}}
+@media(max-width:820px){.stats{grid-template-columns:1fr 1fr}.cols2{grid-template-columns:1fr}.bar{width:calc(100% - 24px);justify-content:flex-end}.stick{position:static}.hero,.cols,.pair{grid-template-columns:1fr}.hero{padding-top:16px;gap:36px}.cols>.panel+.panel{position:static}.bg i{filter:blur(60px)}.glow{display:none}}
 @media(prefers-reduced-motion:reduce){*,::before,::after{animation:none!important;transition:none!important}.glow{display:none}}
 </style>
 <div class=bg><i></i><i></i><i></i><b></b></div><div class=glow></div>
 <header class=topbar><div class=top><a class=brand href="/"><svg width=28 height=28 viewBox="0 0 28 28"><rect x=2 y=7 width=17 height=17 rx=5 fill="#6c7bff"/><rect x=9 y=2 width=17 height=17 rx=5 fill="#3ddbb0" fill-opacity=".9"/></svg>Tickets &amp; Applications</a>
-{% if session.uid %}<div class=who>{{ session.name }}<a class="btn ghost sm" href="/logout">Log out</a></div>{% endif %}</div></header>
+{% if session.uid %}<div class=who>{% if session.avatar %}<img class=me src="https://cdn.discordapp.com/avatars/{{ session.uid }}/{{ session.avatar }}.png?size=64" alt="">{% endif %}{{ session.name }}<a class="btn ghost sm" href="/logout">Log out</a></div>{% endif %}</div></header>
 {% if msg %}<div class=toast role=status>{{ msg }}</div>{% endif %}
 <main>{{ body }}</main>
 <script>
 (function(){
 var $=function(s,r){return(r||document).querySelector(s)},$$=function(s,r){return[].slice.call((r||document).querySelectorAll(s))};
 var t=$('.toast');if(t)setTimeout(function(){t.classList.add('out')},4200);
-$$('form').forEach(function(f){f.addEventListener('submit',function(ev){var b=ev.submitter||f.querySelector('button.btn');if(b)setTimeout(function(){b.disabled=true;b.classList.add('busy')},0)})});
+$$('form').forEach(function(f){f.addEventListener('submit',function(ev){var b=ev.submitter||f.querySelector('button.btn');if(b)setTimeout(function(){if(ev.defaultPrevented)return;b.disabled=true;b.classList.add('busy')},0)})});
 var tabs=$$('.tabs button'),panes=$$('.pane'),ind=$('.tabs i');
 function show(n){tabs.forEach(function(b){var on=b.dataset.t===n;b.setAttribute('aria-selected',on);if(on){ind.style.width=b.offsetWidth+'px';ind.style.transform='translateX('+b.offsetLeft+'px)'}});panes.forEach(function(p){p.hidden=p.id!=='p-'+n})}
 if(tabs.length){tabs.forEach(function(b){b.addEventListener('click',function(){history.replaceState(null,'','#'+b.dataset.t);show(b.dataset.t)})});
-var cur=function(){return location.hash==='#apps'?'apps':'tickets'};show(cur());addEventListener('resize',function(){show(cur())});}
+var cur=function(){var h=location.hash.slice(1);return['overview','tickets','apps','settings'].indexOf(h)>-1?h:'overview'};show(cur());addEventListener('resize',function(){show(cur())});}
 function lab(s,e){var o=s.options[s.selectedIndex];return o&&o.value?o.text:e}
 [['cat','pvcat','no category'],['role','pvrole','only the ticket owner'],['rev','pvrev','no channel yet'],['acc','pvacc','no role'],['tlog','pvtlog','no channel'],['alog','pvalog','no channel']].forEach(function(a){var s=$('#'+a[0]),o=$('#'+a[1]);if(s&&o){var u=function(){o.textContent=lab(s,a[2])};s.addEventListener('change',u);u()}});
 var qs=$('#qs'),add=$('#addq'),qc=$('#qc');
@@ -220,13 +293,14 @@ var kind=pv.dataset.kind,st=($('input[name=style]:checked')||{}).value,title=$('
 $$('[data-for]').forEach(function(e){e.hidden=e.dataset.for.split(',').indexOf(st)<0});
 pv.textContent='';var m=el('div','m'),b=el('div'),emb=el('div','emb');emb.style.setProperty('--c',$('#f-color').value);
 if(title)emb.appendChild(el('b',0,title));if(desc){var p=el('p',0,desc);p.style.whiteSpace='pre-wrap';emb.appendChild(p)}
+var im=$('#f-img').value.trim(),ft=$('#f-foot').value.trim();if(im.indexOf('https://')===0){var pi=el('img','pimg');pi.src=im;pi.alt='';pi.onerror=function(){pi.remove()};emb.appendChild(pi)}if(ft)emb.appendChild(el('small','pft',ft));
 b.appendChild(el('b',0,'Support bot'));b.appendChild(emb);
 if(kind==='ticket'){labels=$$('input[name=opt_label]').map(function(i){return i.value.trim()}).filter(Boolean);if(!labels.length)labels=['Create ticket'];ph=ph||'Select a ticket type'}
 else if(kind==='multi'){labels=$$('input[name=members]:checked').map(function(i){return i.dataset.name});ph=ph||'Choose a topic'}
 else if(st==='menu'){labels=[$('#f-btn').value.trim()||'Apply']}
 else{var c=$$('input[name=forms]:checked');if(!c.length)c=$$('input[name=forms]').filter(function(i){return i.dataset.open==='1'});labels=c.map(function(i){return i.dataset.name});ph=ph||'Choose a form'}
 if(st==='dropdown'){var d=el('div','dsel');d.appendChild(el('span',0,ph));d.appendChild(el('span',0,'\u25be'));b.appendChild(d)}
-else{var r=el('div','dbtns');labels.forEach(function(l){r.appendChild(el('span','dbtn'+(kind==='apply'?' g':''),l))});if(!labels.length)r.appendChild(el('span','hint',kind==='multi'?'Pick at least one ticket panel':'No open forms yet'));b.appendChild(r)}
+else{var cm={blurple:'',gray:' b2',green:' g',red:' r'},bc=($('input[name=button_color]:checked')||{}).value||(kind==='apply'?'green':'blurple'),r=el('div','dbtns');labels.forEach(function(l){r.appendChild(el('span','dbtn'+cm[bc],l))});if(!labels.length)r.appendChild(el('span','hint',kind==='multi'?'Pick at least one ticket panel':'No open forms yet'));b.appendChild(r)}
 m.appendChild(el('div','a','S'));m.appendChild(b);pv.appendChild(m)}
 var os=$('#opts'),ao=$('#addo'),oc=$('#oc');
 function ocount(){if(oc)oc.textContent=$$('.qrow:not(.gone)',os).length+' of 25 types'}
@@ -242,6 +316,16 @@ var gl=$('.glow');
 if(gl&&matchMedia('(pointer:fine)').matches&&!matchMedia('(prefers-reduced-motion:reduce)').matches){var tx=innerWidth/2,ty=innerHeight/3,gx=tx,gy=ty;
 addEventListener('pointermove',function(e){tx=e.clientX;ty=e.clientY;gl.classList.add('on')});
 (function loop(){gx+=(tx-gx)*.08;gy+=(ty-gy)*.08;gl.style.transform='translate3d('+gx+'px,'+gy+'px,0)';requestAnimationFrame(loop)})()}
+function flash(m){var t=document.createElement('div');t.className='toast';t.setAttribute('role','status');t.textContent=m;document.body.appendChild(t);setTimeout(function(){t.classList.add('out');setTimeout(function(){t.remove()},600)},4200)}
+$$('[data-count]').forEach(function(n){var to=+n.dataset.count||0,t0=null;function f(ts){t0=t0||ts;var p=Math.min((ts-t0)/900,1);n.textContent=Math.round(to*(1-Math.pow(1-p,3)));if(p<1)requestAnimationFrame(f)}requestAnimationFrame(f)});
+$$('[data-tab]').forEach(function(a){a.addEventListener('click',function(e){e.preventDefault();history.replaceState(null,'','#'+a.dataset.tab);show(a.dataset.tab)})});
+var sr=$('#srch');if(sr){var tl=$$('.tile');sr.addEventListener('input',function(){var v=sr.value.toLowerCase();tl.forEach(function(t){t.hidden=t.dataset.name.indexOf(v)<0})});addEventListener('keydown',function(e){if(e.key==='/'&&document.activeElement!==sr){e.preventDefault();sr.focus()}})}
+var pf=$('#pform');if(pf){var dirty=false,mark=function(){dirty=true;pf.classList.add('dirty')};pf.addEventListener('input',mark);pf.addEventListener('change',mark);
+pf.addEventListener('click',function(e){if(e.target.closest&&e.target.closest('#addq,#addo,.x'))mark()});
+pf.addEventListener('submit',function(e){if(qs&&!$$('input[name=q]',qs).some(function(i){return i.value.trim()})){e.preventDefault();flash('Add at least one question.');var f0=$('input[name=q]',qs);if(f0)f0.focus();return}dirty=false});
+addEventListener('beforeunload',function(e){if(dirty){e.preventDefault();e.returnValue=''}})}
+document.addEventListener('click',function(e){var a=e.target.closest&&e.target.closest('a[href]');if(!a||e.defaultPrevented||e.button||e.metaKey||e.ctrlKey||e.shiftKey||a.target||a.hasAttribute('data-tab')||a.hasAttribute('download'))return;
+var u=new URL(a.href,location.href);if(u.origin!==location.origin||(u.pathname===location.pathname&&u.hash))return;e.preventDefault();document.body.classList.add('leaving');setTimeout(function(){location.href=a.href},180)});
 })();
 </script>"""
 
@@ -289,7 +373,7 @@ async def callback():
     async with http.get("https://discord.com/api/users/@me", headers=h) as r: u = await r.json()
     async with http.get("https://discord.com/api/users/@me/guilds", headers=h) as r: gs = await r.json()
     session.clear(); session.permanent = True
-    session.update(uid=u["id"], name=u["username"], csrf=secrets.token_hex(16),
+    session.update(uid=u["id"], name=u["username"], avatar=u.get("avatar"), csrf=secrets.token_hex(16),
                    guilds=[{"id": g["id"], "name": g["name"][:30]} for g in gs if can_manage(g)][:30])
     return redirect("/")
 
@@ -310,14 +394,16 @@ async def index():
   <div class=m><div class=a>S</div><div><b>Support bot</b><div class=emb style="--c:#3ddbb0"><b>Application accepted</b><p>Welcome to the team!</p></div></div></div>
  </div></section>""")
     ids = await bot_guild_ids()
-    mine = [dict(g, has_bot=g["id"] in ids, h=int(g["id"]) % 360, ini=(g["name"][:1] or "?").upper(), invite="https://discord.com/oauth2/authorize?" + urlencode({
-        "client_id": CLIENT_ID, "scope": "bot applications.commands", "permissions": 268520464, "guild_id": g["id"]}))
-        for g in session.get("guilds", [])]
+    mine = [dict(g, has_bot=g["id"] in ids, icon=ICONS.get(g["id"]) if g["id"] in ids else None, h=int(g["id"]) % 360, ini=(g["name"][:1] or "?").upper(),
+                 invite="https://discord.com/oauth2/authorize?" + urlencode({"client_id": CLIENT_ID, "scope": "bot applications.commands", "permissions": 268520464, "guild_id": g["id"]}))
+            for g in session.get("guilds", [])]
+    mine.sort(key=lambda g: not g["has_bot"])
     return await page("""<h1 style="font-size:clamp(30px,4vw,44px);margin-top:12px">Your servers</h1>
  <p class=lead>Pick a server to manage its tickets and applications. Servers without the bot show an invite link.</p>
+ {% if mine|length > 6 %}<input id=srch class=search placeholder="Search servers  (press /)" autocomplete=off>{% endif %}
  <div class=tiles>{% for g in mine %}
-  {% if g.has_bot %}<a class=tile href="/g/{{ g.id }}"><div class=ava style="--h:{{ g.h }}">{{ g.ini }}</div><span>{{ g.name }}<small>Open dashboard</small></span></a>
-  {% else %}<a class="tile off" href="{{ g.invite }}"><div class=ava style="--h:{{ g.h }}">{{ g.ini }}</div><span>{{ g.name }}<small>Invite the bot first</small></span></a>{% endif %}
+  <a class="tile {{ '' if g.has_bot else 'off' }}" data-name="{{ g.name|lower }}" href="{{ ('/g/' ~ g.id) if g.has_bot else g.invite }}"><div class=ava style="--h:{{ g.h }}">{% if g.icon %}<img src="https://cdn.discordapp.com/icons/{{ g.id }}/{{ g.icon }}.png?size=96" alt="">{% else %}{{ g.ini }}{% endif %}</div>
+  <span>{{ g.name }}<small>{{ 'Open dashboard' if g.has_bot else 'Invite the bot first' }}</small></span></a>
  {% else %}<div class=empty style="grid-column:1/-1">No servers found. You need the Manage Server permission on a server to see it here.</div>{% endfor %}</div>""", mine=mine)
 
 @web.route("/g/<gid>")
@@ -326,16 +412,54 @@ async def guild_page(gid, gname):
     text, cats, roles = await gdata(gid)
     s = dict(await db("SELECT * FROM settings WHERE guild_id=$1", gid, mode="fetchrow") or {})
     forms = [dict(r, n=len(json.loads(r["questions"]))) for r in await db("SELECT * FROM forms WHERE guild_id=$1 ORDER BY id", gid)]
-    pending = await db("SELECT COUNT(*) FROM apps WHERE guild_id=$1 AND status='pending'", gid, mode="fetchval")
     panels = [dict(r) for r in await db("SELECT * FROM panels WHERE guild_id=$1 ORDER BY id", gid)]
     chn = {c["id"]: c["name"] for c in text}
+    ts = dict(await db("""SELECT COUNT(*) FILTER (WHERE status='open') AS open, COUNT(*) FILTER (WHERE opened_at > now() - interval '7 days') AS week
+                          FROM tickets WHERE guild_id=$1""", gid, mode="fetchrow"))
+    ap = dict(await db("""SELECT COUNT(*) FILTER (WHERE status='pending') AS pending, COUNT(*) FILTER (WHERE created_at > now() - interval '7 days') AS week
+                          FROM apps WHERE guild_id=$1""", gid, mode="fetchrow"))
+    series = await db(SERIES_SQL, gid)
+    mx = max([r["t"] for r in series] + [r["a"] for r in series] + [1])
+    days = [dict(day=r["day"].strftime("%d"), tip=f'{r["day"]:%d %b}: {r["t"]} tickets, {r["a"]} applications', th=round(r["t"] * 100 / mx), ah=round(r["a"] * 100 / mx)) for r in series]
+    rt = [dict(r) for r in await db("SELECT * FROM tickets WHERE guild_id=$1 ORDER BY opened_at DESC LIMIT 8", gid)]
+    ra = [dict(r) for r in await db("""SELECT a.*, COALESCE(f.name,'Application') AS fname FROM apps a LEFT JOIN forms f ON f.id=a.form_id
+                                       WHERE a.guild_id=$1 ORDER BY a.created_at DESC LIMIT 8""", gid)]
+    ev = sorted([dict(k="ticket", who=r["user_name"], what=r["label"], at=r["opened_at"], st=r["status"]) for r in rt]
+                + [dict(k="application", who=r["user_name"], what=r["fname"], at=r["created_at"], st=r["status"]) for r in ra],
+                key=lambda e: e["at"], reverse=True)[:8]
+    bl = await db("SELECT user_id, reason FROM blacklist WHERE guild_id=$1 LIMIT 50", gid)
+    names = await asyncio.gather(*[uname(r["user_id"]) for r in bl])
+    blocked = [dict(user_id=r["user_id"], reason=r["reason"], name=n) for r, n in zip(bl, names)]
+    steps = [("Set a support role", bool(s.get("support_role") or any(p["support_role"] for p in panels)), "tickets"),
+             ("Create a ticket panel", any(p["kind"] == "ticket" for p in panels), "tickets"),
+             ("Publish a panel", any(p["message_id"] for p in panels), "tickets"),
+             ("Create an application form", bool(forms), "apps"),
+             ("Set up a log channel", bool(s.get("ticket_log") or s.get("app_log")), "settings")]
+    done = sum(1 for x in steps if x[1])
+    cards = [("Open tickets", ts["open"], ICO["ticket"]), ("Tickets this week", ts["week"], ICO["trend"]),
+             ("Pending applications", ap["pending"], ICO["clock"]), ("Applications this week", ap["week"], ICO["inbox"])]
     return await page("""{% macro prow(p) %}<div class=row><div class=n><b>{{ p.name }}</b><small>{{ styles[p.style] }} &middot; {{ ('published in ' ~ chn[p.channel_id]) if p.message_id and chn.get(p.channel_id) else 'not published' }}</small></div>
 <a class="btn ghost sm" href="/g/{{ gid }}/panel/{{ p.id }}">Edit</a>
-<form method=post data-confirm="Delete this panel?" action="/g/{{ gid }}/panel/{{ p.id }}/delete"><input type=hidden name=csrf value="{{ session.csrf }}"><button class="btn bad sm">Delete</button></form></div>{% endmacro %}<a class=back href="/">&larr; All servers</a>
-<div class=head><h1>{{ gname }}</h1></div>
-<nav class=tabs role=tablist><button data-t=tickets role=tab>Tickets</button><button data-t=apps role=tab>Applications{% if pending %}<span class=badge>{{ pending }}</span>{% endif %}</button><i></i></nav>
+<form method=post action="/g/{{ gid }}/panel/{{ p.id }}/duplicate"><input type=hidden name=csrf value="{{ session.csrf }}"><button class="btn ghost sm">Copy</button></form>
+<form method=post data-confirm="Delete this panel?" action="/g/{{ gid }}/panel/{{ p.id }}/delete"><input type=hidden name=csrf value="{{ session.csrf }}"><button class="btn bad sm">Delete</button></form></div>{% endmacro %}
+<a class=back href="/">&larr; All servers</a>
+<div class=head>{% if icon %}<img class=hico src="https://cdn.discordapp.com/icons/{{ gid }}/{{ icon }}.png?size=128" alt="">{% endif %}<h1>{{ gname }}</h1></div>
+<nav class=tabs role=tablist><button data-t=overview role=tab>Overview</button><button data-t=tickets role=tab>Tickets</button><button data-t=apps role=tab>Applications{% if ap.pending %}<span class=badge>{{ ap.pending }}</span>{% endif %}</button><button data-t=settings role=tab>Settings</button><i></i></nav>
 
-<section class=pane id=p-tickets><div class=cols>
+<section class=pane id=p-overview>
+ {% if done < steps|length %}<div class="panel setup"><div class=split style="margin:0"><h2>Get started</h2><span>{{ done }} of {{ steps|length }} done</span></div>
+  <div class=prog><i style="width:{{ (done * 100 / steps|length)|round|int }}%"></i></div>
+  <div class=steps>{% for label, ok, tab in steps %}<a data-tab="{{ tab }}" href="#{{ tab }}" class="step {{ 'done' if ok }}"><span class=tick>{{ '✓' if ok }}</span><span>{{ label }}</span></a>{% endfor %}</div></div>{% endif %}
+ <div class=stats>{% for label, n, ico in cards %}<div class="panel stat"><div class=ico>{{ ico }}</div><b data-count="{{ n }}">0</b><span>{{ label }}</span></div>{% endfor %}</div>
+ <div class=cols2>
+  <div class=panel><div class=split style="margin:0"><h2>Last 14 days</h2><span class=legend><span><i class=b1></i>Tickets</span><span><i class=b2></i>Applications</span></span></div>
+   <div class=chart>{% for d in days %}<div class=day title="{{ d.tip }}"><div class=bars style="--n:{{ loop.index0 }}"><i class=b1 style="height:{{ d.th }}%;--n:{{ loop.index0 }}"></i><i class=b2 style="height:{{ d.ah }}%;--n:{{ loop.index0 }}"></i></div><small>{{ d.day }}</small></div>{% endfor %}</div></div>
+  <div class=panel><h2>Recent activity</h2><div class=feed>{% for e in ev %}<div class=ev><span class="dot {{ e.k }}"></span><div><b>{{ e.who or 'Unknown' }}</b> {{ 'opened a ticket' if e.k == 'ticket' else 'applied' }}<small>{{ e.what }} &middot; {{ ago(e.at) }}</small></div><span class="chip {{ e.st }}">{{ e.st }}</span></div>
+   {% else %}<div class=empty>Nothing yet. Tickets and applications show up here as they happen.</div>{% endfor %}</div></div>
+ </div>
+</section>
+
+<section class=pane id=p-tickets hidden><div class=cols>
  <div class=panel><h2>Ticket settings</h2><p class=lead>Defaults for every ticket panel. Each panel can override them in its own settings.</p>
   <form method=post action="/g/{{ gid }}/tickets"><input type=hidden name=csrf value="{{ session.csrf }}">
    <label for=cat>Ticket category</label><select id=cat name=ticket_category>{{ opts(cats, s.ticket_category) }}</select>
@@ -350,38 +474,180 @@ async def guild_page(gid, gname):
  <div class=panel><h2>Multi panels</h2><p class=lead>Combine several ticket panels into one message, for example a dropdown where every entry opens a different kind of ticket.</p>
   <div class=rows>{% for p in mpanels %}{{ prow(p) }}{% else %}<div class=empty>No multi panels yet. Create at least one ticket panel first, then combine them here.</div>{% endfor %}</div>
   <p style="margin:22px 0 0"><a class="btn {{ '' if tpanels else 'ghost' }}" href="/g/{{ gid }}/panel/new?kind=multi">New multi panel</a></p></div>
+ <div class=panel><h2>Recent tickets</h2><div class=feed>{% for r in rt %}<div class=ev><span class="dot ticket"></span><div><b>#{{ '%04d'|format(r.num or 0) }}</b> {{ r.user_name or 'Unknown' }}<small>{{ r.label }} &middot; {{ ago(r.opened_at) }}</small></div><span class="chip {{ r.status }}">{{ r.status }}</span></div>
+  {% else %}<div class=empty>Tickets show up here once members open them.</div>{% endfor %}</div></div>
+ </div></div></section>
+
+<section class=pane id=p-apps hidden><div class=cols>
+ <div class=stack>
+  <div class=panel><h2>Your forms</h2><p class=lead>Closed forms disappear from the Apply menus right away.</p>
+   <div class=rows>{% for f in forms %}<div class=row>
+    <div class=n><b>{{ f.name }}</b><small>{{ f.n }} question{{ '' if f.n == 1 else 's' }} &middot; {{ 'accepting applications' if f.open else 'closed' }}</small></div>
+    <a class="btn ghost sm" href="/g/{{ gid }}/form/{{ f.id }}">Edit</a>
+    <form method=post action="/g/{{ gid }}/form/{{ f.id }}/toggle"><input type=hidden name=csrf value="{{ session.csrf }}"><button class="sw {{ 'on' if f.open }}" aria-label="{{ 'Close form' if f.open else 'Open form' }}" title="{{ 'Close form' if f.open else 'Open form' }}"></button></form>
+    <form method=post data-confirm="Delete this form?" action="/g/{{ gid }}/form/{{ f.id }}/delete"><input type=hidden name=csrf value="{{ session.csrf }}"><button class="btn bad sm">Delete</button></form></div>
+   {% else %}<div class=empty>No forms yet. Create your first one and it shows up in the Apply menus straight away.</div>{% endfor %}</div>
+   <p style="margin:22px 0 0"><a class=btn href="/g/{{ gid }}/form/new">New form</a></p></div>
+  <div class=panel><h2>Application panels</h2><p class=lead>Show one button, a button per form, or a dropdown. After you add or rename forms, publish the panel again.</p>
+   <div class=rows>{% for p in apanels %}{{ prow(p) }}{% else %}<div class=empty>No panels yet. Create one to let members apply.</div>{% endfor %}</div>
+   <p style="margin:22px 0 0"><a class=btn href="/g/{{ gid }}/panel/new?kind=apply">New application panel</a></p></div>
  </div>
-</div></section>
+ <div class=stack>
+  <div class=panel><h2>Inbox</h2><p class=lead>Every submitted application, with all answers.</p>
+   <div class=feed>{% for r in ra[:5] %}<div class=ev><span class="dot application"></span><div><b>{{ r.user_name or 'Unknown' }}</b><small>{{ r.fname }} &middot; {{ ago(r.created_at) }}</small></div><span class="chip {{ r.status }}">{{ r.status }}</span></div>
+   {% else %}<div class=empty>No applications yet.</div>{% endfor %}</div>
+   <p style="margin:22px 0 0;display:flex;gap:10px;flex-wrap:wrap"><a class=btn href="/g/{{ gid }}/applications">Open inbox</a><a class="btn ghost" download href="/g/{{ gid }}/applications.csv">Export CSV</a></p></div>
+  <div class=panel><h2>Application log</h2><p class=lead>Get a message whenever someone applies and when an application is accepted or denied.</p>
+   <form method=post action="/g/{{ gid }}/applog"><input type=hidden name=csrf value="{{ session.csrf }}">
+    <label for=alog>Log channel</label><select id=alog name=app_log>{{ opts(text, s.app_log) }}</select>
+    <p class=hint>Events are logged in <b id=pvalog>no channel</b>.</p>
+    <p style="margin:22px 0 0"><button class=btn>Save log channel</button></p></form></div>
+ </div></div></section>
 
-<section class=pane id=p-apps hidden><div class=stack>
- <div class=panel><h2>Application log</h2><p class=lead>Get a message whenever someone applies and when an application is accepted or denied.</p>
-  <form method=post action="/g/{{ gid }}/applog"><input type=hidden name=csrf value="{{ session.csrf }}">
-   <label for=alog>Log channel</label><select id=alog name=app_log>{{ opts(text, s.app_log) }}</select>
-   <p class=hint>Events are logged in <b id=pvalog>no channel</b>.</p>
-   <p style="margin:22px 0 0"><button class=btn>Save log channel</button></p></form></div>
+<section class=pane id=p-settings hidden><div class=cols>
+ <div class=panel><h2>Transcripts</h2><p class=lead>When a ticket is closed, the whole conversation is saved as a text file.</p>
+  <form method=post action="/g/{{ gid }}/settings"><input type=hidden name=csrf value="{{ session.csrf }}">
+   <label for=tm>What to do with transcripts</label><select id=tm name=transcripts>{% for v, l in tmodes %}<option value="{{ v }}" {{ 'selected' if (s.transcripts or 'log') == v }}>{{ l }}</option>{% endfor %}</select>
+   <p class=hint>Transcripts are posted in the ticket's log channel, so set one on the Tickets tab first.</p>
+   <p style="margin:22px 0 0"><button class=btn>Save</button></p></form></div>
+ <div class=panel><h2>Blocked users</h2><p class=lead>Blocked users cannot open tickets or apply. Use their Discord user ID (turn on Developer Mode, then right-click a user and copy the ID).</p>
+  <form method=post action="/g/{{ gid }}/blacklist" class=inline style="margin-top:16px"><input type=hidden name=csrf value="{{ session.csrf }}">
+   <input name=user_id inputmode=numeric pattern="[0-9]{15,22}" placeholder="User ID" aria-label="User ID" required><input name=reason maxlength=200 placeholder="Reason (optional)" aria-label="Reason"><button class=btn>Block</button></form>
+  <div class=rows>{% for b in blocked %}<div class=row><div class=n><b>{{ b.name or 'Unknown user' }}</b><small>{{ b.user_id }}{{ ' &middot; ' ~ b.reason if b.reason else '' }}</small></div>
+   <form method=post action="/g/{{ gid }}/blacklist/{{ b.user_id }}/remove"><input type=hidden name=csrf value="{{ session.csrf }}"><button class="btn ghost sm">Unblock</button></form></div>
+  {% else %}<div class=empty>Nobody is blocked.</div>{% endfor %}</div></div>
+</div></section>""", gname=gname, gid=gid, s=s, forms=forms, text=text, cats=cats, roles=roles, icon=ICONS.get(gid), chn=chn, styles=STYLE_NAMES,
+        tpanels=[p for p in panels if p["kind"] == "ticket"], apanels=[p for p in panels if p["kind"] == "apply"], mpanels=[p for p in panels if p["kind"] == "multi"],
+        ts=ts, ap=ap, days=days, rt=rt, ra=ra, ev=ev, blocked=blocked, steps=steps, done=done, cards=cards,
+        tmodes=[("off", "Off"), ("log", "Send to the log channel"), ("both", "Log channel and DM to the opener")])
 
- <div class=panel><h2>Your forms</h2><p class=lead>Closed forms disappear from the Apply menu right away. Pending applications: <b>{{ pending }}</b>.</p>
-  <div class=rows>{% for f in forms %}<div class=row>
-   <div class=n><b>{{ f.name }}</b><small>{{ f.n }} question{{ '' if f.n == 1 else 's' }} &middot; {{ 'accepting applications' if f.open else 'closed' }}</small></div>
-   <form method=post action="/g/{{ gid }}/form/{{ f.id }}/toggle"><input type=hidden name=csrf value="{{ session.csrf }}"><button class="sw {{ 'on' if f.open }}" aria-label="{{ 'Close form' if f.open else 'Open form' }}" title="{{ 'Close form' if f.open else 'Open form' }}"></button></form>
-   <form method=post data-confirm="Delete this form?" action="/g/{{ gid }}/form/{{ f.id }}/delete"><input type=hidden name=csrf value="{{ session.csrf }}"><button class="btn bad sm">Delete</button></form></div>
-  {% else %}<div class=empty>No forms yet. Create your first one below and it shows up in the Apply menu straight away.</div>{% endfor %}</div></div>
+@web.post("/g/<gid>/settings")
+@guild_route
+async def save_settings(gid, gname):
+    f = await request.form
+    mode = f.get("transcripts") if f.get("transcripts") in ("off", "log", "both") else "log"
+    await db("""INSERT INTO settings(guild_id,transcripts) VALUES($1,$2) ON CONFLICT(guild_id) DO UPDATE SET transcripts=EXCLUDED.transcripts""", gid, mode, mode="execute")
+    session["msg"] = "Settings saved."
+    return redirect(f"/g/{gid}#settings")
 
- <div class=panel><h2>New form</h2><p class=lead>Applicants answer each question in a DM with the bot.</p>
-  <form method=post action="/g/{{ gid }}/form"><input type=hidden name=csrf value="{{ session.csrf }}">
-   <label for=fname>Form name</label><input id=fname name=name maxlength=100 placeholder="Moderator" required>
-   <label>Questions</label><div id=qs></div>
-   <div class=split><span id=qc></span><button type=button id=addq class="btn ghost sm">Add question</button></div>
-   <div class=pair><div><label for=rev>Review channel</label><select id=rev name=review_channel>{{ opts(text) }}</select></div>
-   <div><label for=acc>Role on acceptance</label><select id=acc name=accept_role>{{ opts(roles) }}</select></div></div>
-   <p class=hint>Submissions go to <b id=pvrev>no channel yet</b>. Accepted applicants receive <b id=pvacc>no role</b>.</p>
-   <p style="margin:22px 0 0"><button class=btn>Create form</button></p></form></div>
+@web.post("/g/<gid>/blacklist")
+@guild_route
+async def blacklist_add(gid, gname):
+    f = await request.form
+    uid = f.get("user_id", "").strip()
+    name = await uname(uid) if re.fullmatch(r"\d{15,22}", uid) else None
+    if not name: session["msg"] = "That user ID was not found."
+    else:
+        await db("""INSERT INTO blacklist(guild_id,user_id,reason) VALUES($1,$2,$3) ON CONFLICT(guild_id,user_id) DO UPDATE SET reason=EXCLUDED.reason""",
+                 gid, uid, f.get("reason", "").strip()[:200], mode="execute")
+        session["msg"] = f"{name} is now blocked."
+    return redirect(f"/g/{gid}#settings")
 
- <div class=panel><h2>Application panels</h2><p class=lead>Show one button, a button per form, or a dropdown. After you add or rename forms, publish the panel again.</p>
-  <div class=rows>{% for p in apanels %}{{ prow(p) }}{% else %}<div class=empty>No panels yet. Create one to let members apply.</div>{% endfor %}</div>
-  <p style="margin:22px 0 0"><a class=btn href="/g/{{ gid }}/panel/new?kind=apply">New application panel</a></p></div>
-</div></section>""", gname=gname, gid=gid, s=s, forms=forms, pending=pending, text=text, cats=cats, roles=roles,
-        tpanels=[p for p in panels if p["kind"] == "ticket"], apanels=[p for p in panels if p["kind"] == "apply"], mpanels=[p for p in panels if p["kind"] == "multi"], chn=chn, styles=STYLE_NAMES)
+@web.post("/g/<gid>/blacklist/<uid>/remove")
+@guild_route
+async def blacklist_remove(gid, gname, uid):
+    await db("DELETE FROM blacklist WHERE guild_id=$1 AND user_id=$2", gid, uid, mode="execute")
+    session["msg"] = "User unblocked."
+    return redirect(f"/g/{gid}#settings")
+
+# ---- application inbox ----
+async def inbox_rows(gid, args, limit=100):
+    where, a = ["a.guild_id=$1"], [gid]
+    if args.get("status") in ("pending", "accepted", "denied"): a.append(args["status"]); where.append(f"a.status=${len(a)}")
+    if args.get("form", "").isdigit(): a.append(int(args["form"])); where.append(f"a.form_id=${len(a)}")
+    if args.get("q", "").strip(): a.append("%" + args["q"].strip()[:60] + "%"); where.append(f"(a.user_name ILIKE ${len(a)} OR a.user_id ILIKE ${len(a)})")
+    sql = f"""SELECT a.*, COALESCE(f.name,'Application') AS fname, COALESCE(f.questions,'[]') AS fq FROM apps a LEFT JOIN forms f ON f.id=a.form_id
+              WHERE {' AND '.join(where)} ORDER BY a.created_at DESC LIMIT {int(limit)}"""
+    return [dict(r) for r in await db(sql, *a)]
+
+@web.route("/g/<gid>/applications")
+@guild_route
+async def inbox(gid, gname):
+    rows = await inbox_rows(gid, request.args)
+    for r in rows:
+        qs, ans = json.loads(r["fq"]), json.loads(r["answers"] or "[]")
+        r["qa"] = [(qs[n] if n < len(qs) else f"Question {n + 1}", x) for n, x in enumerate(ans)]
+    forms = [dict(r) for r in await db("SELECT id,name FROM forms WHERE guild_id=$1 ORDER BY id", gid)]
+    return await page("""<a class=back href="/g/{{ gid }}#apps">&larr; Back to {{ gname }}</a>
+<div class=head><h1>Application inbox</h1></div>
+<div class=panel><form method=get class=filters>
+ <select name=status aria-label=Status><option value="">All statuses</option>{% for v in ['pending', 'accepted', 'denied'] %}<option value="{{ v }}" {{ 'selected' if args.get('status') == v }}>{{ v|capitalize }}</option>{% endfor %}</select>
+ <select name=form aria-label=Form><option value="">All forms</option>{% for f in forms %}<option value="{{ f.id }}" {{ 'selected' if args.get('form') == f.id|string }}>{{ f.name }}</option>{% endfor %}</select>
+ <input name=q value="{{ args.get('q', '') }}" placeholder="Search by name or ID" aria-label=Search>
+ <button class=btn>Filter</button><a class="btn ghost" download href="/g/{{ gid }}/applications.csv?{{ qs }}">Export CSV</a></form>
+ {% for r in rows %}<details class=app><summary><span class="dot application"></span><div><b>{{ r.user_name or 'Unknown' }}</b><small>{{ r.fname }} &middot; {{ ago(r.created_at) }}{{ ' &middot; reviewed by ' ~ r.reviewer if r.reviewer else '' }}</small></div><span class="chip {{ r.status }}">{{ r.status }}</span></summary>
+  <dl class=qa>{% for q, a in r.qa %}<dt>{{ q }}</dt><dd>{{ a }}</dd>{% endfor %}</dl></details>
+ {% else %}<div class=empty style="margin-top:18px">No applications match.</div>{% endfor %}</div>""",
+        gname=gname, gid=gid, rows=rows, forms=forms, args=request.args, qs=urlencode({k: v for k, v in request.args.items() if k in ("status", "form", "q") and v}))
+
+@web.route("/g/<gid>/applications.csv")
+@guild_route
+async def inbox_csv(gid, gname):
+    rows = await inbox_rows(gid, request.args, limit=5000)
+    safe = lambda x: ("'" + str(x)) if str(x or "")[:1] in ("=", "+", "-", "@", "\t", "\r") else str(x if x is not None else "")
+    out = io.StringIO(); w = csv.writer(out)
+    w.writerow(["id", "form", "user_id", "user_name", "status", "applied_at", "reviewed_by", "answers"])
+    for r in rows:
+        qs, ans = json.loads(r["fq"]), json.loads(r["answers"] or "[]")
+        w.writerow([safe(x) for x in (r["id"], r["fname"], r["user_id"], r["user_name"], r["status"], r["created_at"], r["reviewer"],
+                    " | ".join(f"{qs[n] if n < len(qs) else 'Q' + str(n + 1)}: {x}" for n, x in enumerate(ans)))])
+    return Response("\ufeff" + out.getvalue(), mimetype="text/csv", headers={"Content-Disposition": f'attachment; filename="applications-{gid}.csv"'})
+
+# ---- form editor ----
+@web.route("/g/<gid>/form/<fid>")
+@guild_route
+async def form_edit(gid, gname, fid):
+    text, cats, roles = await gdata(gid)
+    if fid == "new":
+        f = dict(id=None, name="", questions=[""], review_channel=None, accept_role=None, required_role=None, cooldown_hours=0, accept_msg="", deny_msg="")
+    else:
+        row = await db("SELECT * FROM forms WHERE id=$1 AND guild_id=$2", int(fid) if fid.isdigit() else 0, gid, mode="fetchrow")
+        if not row: abort(404)
+        f = dict(row); f["questions"] = json.loads(f["questions"] or "[]") or [""]
+    return await page("""<a class=back href="/g/{{ gid }}#apps">&larr; Back to {{ gname }}</a>
+<div class=head><h1>{{ 'Edit' if f.id else 'New' }} form</h1></div>
+<form method=post action="/g/{{ gid }}/form/save" id=pform><input type=hidden name=csrf value="{{ session.csrf }}"><input type=hidden name=fid value="{{ f.id or '' }}">
+<div class=cols><div class=stack>
+ <div class=panel><h2>Questions</h2><p class=lead>Applicants answer each question in a DM with the bot.</p>
+  <label for=fname>Form name</label><input id=fname name=name maxlength=100 value="{{ f.name }}" placeholder="Moderator" required>
+  <label>Questions</label><div id=qs>{% for q in f.questions %}<div class=qrow><input name=q maxlength=250 placeholder="Type a question" aria-label="Question" value="{{ q }}"><button type=button class=x aria-label="Remove question">&times;</button></div>{% endfor %}</div>
+  <div class=split><span id=qc></span><button type=button id=addq class="btn ghost sm">Add question</button></div></div>
+ <div class=panel><h2>Messages</h2><p class=lead>Optional DMs for the applicant. Write {user} for their name and {form} for the form name.</p>
+  <label for=am>Acceptance message</label><textarea id=am name=accept_msg rows=3 maxlength=1000 placeholder="Your application ({form}) was accepted!">{{ f.accept_msg or '' }}</textarea>
+  <label for=dm>Denial message</label><textarea id=dm name=deny_msg rows=3 maxlength=1000 placeholder="Unfortunately, your application ({form}) was denied.">{{ f.deny_msg or '' }}</textarea></div>
+</div>
+<div class="panel stick"><h2>Rules</h2>
+ <label for=rev>Review channel</label><select id=rev name=review_channel>{{ opts(text, f.review_channel) }}</select>
+ <label for=acc>Role on acceptance</label><select id=acc name=accept_role>{{ opts(roles, f.accept_role) }}</select>
+ <label for=rr>Role required to apply</label><select id=rr name=required_role>{{ opts(roles, f.required_role) }}</select>
+ <label for=cd>Cooldown between applications (hours)</label><input id=cd type=number min=0 max=720 name=cooldown_hours value="{{ f.cooldown_hours or 0 }}">
+ <p class=hint>Submissions go to <b id=pvrev>no channel yet</b>. Accepted applicants receive <b id=pvacc>no role</b>. Members can only have one pending application per form.</p></div>
+</div>
+<div class=bar><span class=dirtymsg>Unsaved changes</span><button class=btn>Save form</button></div><div style="height:72px"></div></form>""", gname=gname, gid=gid, f=f, text=text, roles=roles)
+
+@web.post("/g/<gid>/form/save")
+@guild_route
+async def form_save(gid, gname):
+    f = await request.form
+    text, cats, roles = await gdata(gid)
+    qs = [x.strip()[:250] for x in f.getlist("q") if x.strip()][:25]
+    fid = int(f["fid"]) if f.get("fid", "").isdigit() else None
+    if not qs:
+        session["msg"] = "Add at least one question."
+        return redirect(f"/g/{gid}/form/{fid or 'new'}")
+    pick = lambda key, items: f.get(key) if f.get(key) in {c["id"] for c in items} else None
+    hours = min(max(int(f["cooldown_hours"]), 0), 720) if f.get("cooldown_hours", "").isdigit() else 0
+    vals = (f.get("name", "").strip()[:100] or "Application", json.dumps(qs), pick("review_channel", text), pick("accept_role", roles), pick("required_role", roles),
+            hours, f.get("accept_msg", "").strip()[:1000] or None, f.get("deny_msg", "").strip()[:1000] or None)
+    if fid:
+        if not await db("SELECT 1 FROM forms WHERE id=$1 AND guild_id=$2", fid, gid, mode="fetchrow"): abort(404)
+        await db("""UPDATE forms SET name=$1,questions=$2,review_channel=$3,accept_role=$4,required_role=$5,cooldown_hours=$6,accept_msg=$7,deny_msg=$8
+                    WHERE id=$9 AND guild_id=$10""", *vals, fid, gid, mode="execute")
+    else:
+        await db("""INSERT INTO forms(name,questions,review_channel,accept_role,required_role,cooldown_hours,accept_msg,deny_msg,guild_id)
+                    VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9)""", *vals, gid, mode="execute")
+    session["msg"] = "Form saved."
+    return redirect(f"/g/{gid}#apps")
 
 @web.post("/g/<gid>/tickets")
 @guild_route
@@ -395,7 +661,7 @@ async def save_tickets(gid, gname):
                 DO UPDATE SET ticket_category=EXCLUDED.ticket_category, support_role=EXCLUDED.support_role, ticket_log=EXCLUDED.ticket_log""",
              gid, cat, role, tlog, mode="execute")
     session["msg"] = "Ticket settings saved."
-    return redirect(f"/g/{gid}")
+    return redirect(f"/g/{gid}#tickets")
 
 @web.post("/g/<gid>/applog")
 @guild_route
@@ -408,22 +674,6 @@ async def save_applog(gid, gname):
     session["msg"] = "Application log saved."
     return redirect(f"/g/{gid}#apps")
 
-@web.post("/g/<gid>/form")
-@guild_route
-async def add_form(gid, gname):
-    f = await request.form
-    text, cats, roles = await gdata(gid)
-    qs = [x.strip()[:250] for x in f.getlist("q") if x.strip()][:25]
-    if not qs:
-        session["msg"] = "Add at least one question."
-        return redirect(f"/g/{gid}#apps")
-    rc = f.get("review_channel") if f.get("review_channel") in {c["id"] for c in text} else None
-    ar = f.get("accept_role") if f.get("accept_role") in {r["id"] for r in roles} else None
-    await db("INSERT INTO forms(guild_id,name,questions,review_channel,accept_role) VALUES($1,$2,$3,$4,$5)",
-             gid, f["name"][:100], json.dumps(qs), rc, ar, mode="execute")
-    session["msg"] = "Form created."
-    return redirect(f"/g/{gid}#apps")
-
 @web.post("/g/<gid>/form/<fid>/<action>")
 @guild_route
 async def form_action(gid, gname, fid, action):
@@ -432,11 +682,13 @@ async def form_action(gid, gname, fid, action):
     return redirect(f"/g/{gid}#apps")
 
 STYLE_NAMES = {"button": "Buttons", "dropdown": "Dropdown", "menu": "Single button", "buttons": "Button per form"}
+BS = {"blurple": 1, "gray": 2, "green": 3, "red": 4}
+def bs(p, d): return BS.get(p.get("button_color") or d, BS[d])
 STYLES = {"ticket": ["button", "dropdown"], "apply": ["menu", "buttons", "dropdown"], "multi": ["dropdown", "button"]}
 
 def default_panel(kind):
     base = dict(id=None, kind=kind, button_label="", placeholder="", options=[], forms=[], members=[], channel_id=None,
-                ticket_category=None, support_role=None, ticket_log=None, welcome="", entry_desc="")
+                ticket_category=None, support_role=None, ticket_log=None, welcome="", entry_desc="", image_url="", footer="", button_color=None)
     if kind == "apply":
         return dict(base, name="Application panel", style="menu", title="Applications", description="Click the button below to apply.",
                     color="#57F287", button_label="Apply", placeholder="Choose a form")
@@ -454,13 +706,15 @@ async def build_payload(gid, p):
     if p["title"]: emb["title"] = p["title"]
     if p["description"]: emb["description"] = p["description"]
     if len(emb) == 1: emb["title"] = "Support" if p["kind"] == "ticket" else "Applications"
+    if (p.get("image_url") or "").startswith("https://"): emb["image"] = {"url": p["image_url"]}
+    if p.get("footer"): emb["footer"] = {"text": p["footer"]}
     if p["kind"] == "ticket":
         opts = json.loads(p["options"] or "[]") or [{"label": "Create ticket", "desc": ""}]
         if p["style"] == "dropdown":
             comps = [{"type": 1, "components": [{"type": 3, "custom_id": f"tk:s:{p['id']}", "placeholder": p["placeholder"] or "Select a ticket type",
                       "options": [dict(label=o["label"], value=str(n), **({"description": o["desc"]} if o.get("desc") else {})) for n, o in enumerate(opts)]}]}]
         else:
-            comps = chunk([{"type": 2, "style": 1, "label": o["label"], "custom_id": f"tk:b:{p['id']}:{n}"} for n, o in enumerate(opts)])
+            comps = chunk([{"type": 2, "style": bs(p, "blurple"), "label": o["label"], "custom_id": f"tk:b:{p['id']}:{n}"} for n, o in enumerate(opts)])
     elif p["kind"] == "multi":
         ids = [int(x) for x in json.loads(p["members"] or "[]")]
         rows = [r for r in await db("SELECT id,name,button_label,entry_desc FROM panels WHERE guild_id=$1 AND kind='ticket' ORDER BY id", gid) if r["id"] in ids][:25]
@@ -470,9 +724,9 @@ async def build_payload(gid, p):
             comps = [{"type": 1, "components": [{"type": 3, "custom_id": f"mp:s:{p['id']}", "placeholder": p["placeholder"] or "Choose a topic",
                       "options": [dict(label=l, value=str(mid), **({"description": d} if d else {})) for mid, l, d in ents]}]}]
         else:
-            comps = chunk([{"type": 2, "style": 1, "label": l, "custom_id": f"mp:b:{p['id']}:{mid}"} for mid, l, d in ents])
+            comps = chunk([{"type": 2, "style": bs(p, "blurple"), "label": l, "custom_id": f"mp:b:{p['id']}:{mid}"} for mid, l, d in ents])
     elif p["style"] == "menu":
-        comps = chunk([{"type": 2, "style": 3, "label": p["button_label"] or "Apply", "custom_id": f"ap:m:{p['id']}"}])
+        comps = chunk([{"type": 2, "style": bs(p, "green"), "label": p["button_label"] or "Apply", "custom_id": f"ap:m:{p['id']}"}])
     else:
         ids = [int(x) for x in json.loads(p["forms"] or "[]")]
         rows = [r for r in await db("SELECT id,name FROM forms WHERE guild_id=$1 AND open ORDER BY id LIMIT 25", gid) if not ids or r["id"] in ids]
@@ -481,7 +735,7 @@ async def build_payload(gid, p):
             comps = [{"type": 1, "components": [{"type": 3, "custom_id": f"ap:s:{p['id']}", "placeholder": p["placeholder"] or "Choose a form",
                       "options": [{"label": r["name"][:100], "value": str(r["id"])} for r in rows]}]}]
         else:
-            comps = chunk([{"type": 2, "style": 3, "label": r["name"][:80], "custom_id": f"ap:b:{r['id']}"} for r in rows])
+            comps = chunk([{"type": 2, "style": bs(p, "green"), "label": r["name"][:80], "custom_id": f"ap:b:{r['id']}"} for r in rows])
     return {"embeds": [emb], "components": comps}
 
 async def publish_panel(gid, pid):
@@ -514,17 +768,20 @@ async def panel_edit(gid, gname, pid):
         p["members"] = [int(x) for x in json.loads(p["members"] or "[]")]
     forms = [dict(r) for r in await db("SELECT id,name,open FROM forms WHERE guild_id=$1 ORDER BY id", gid)]
     tickets = [dict(r) for r in await db("SELECT id,name,button_label,entry_desc FROM panels WHERE guild_id=$1 AND kind='ticket' ORDER BY id", gid)]
-    return await page("""<a class=back href="/g/{{ gid }}{{ '#apps' if p.kind == 'apply' else '' }}">&larr; Back to {{ gname }}</a>
+    return await page("""<a class=back href="/g/{{ gid }}{{ '#apps' if p.kind == 'apply' else '#tickets' }}">&larr; Back to {{ gname }}</a>
 <div class=head><h1>{{ 'Edit' if p.id else 'New' }} {{ {'ticket': 'ticket', 'apply': 'application', 'multi': 'multi'}[p.kind] }} panel</h1></div>
-<form method=post action="/g/{{ gid }}/panel/save"><input type=hidden name=csrf value="{{ session.csrf }}"><input type=hidden name=kind value="{{ p.kind }}"><input type=hidden name=pid value="{{ p.id or '' }}">
+<form method=post action="/g/{{ gid }}/panel/save" id=pform><input type=hidden name=csrf value="{{ session.csrf }}"><input type=hidden name=kind value="{{ p.kind }}"><input type=hidden name=pid value="{{ p.id or '' }}">
 <div class=cols><div class=stack>
  <div class=panel><h2>Message</h2><p class=lead>The text and color of the message members see.</p>
   <label for=f-name>Panel name (only you see this)</label><input id=f-name name=name maxlength=60 value="{{ p.name }}" required>
   <label for=f-title>Title</label><input id=f-title name=title maxlength=200 value="{{ p.title }}">
   <label for=f-desc>Description</label><textarea id=f-desc name=description rows=4 maxlength=2000>{{ p.description }}</textarea>
-  <label for=f-color>Accent color</label><input id=f-color type=color name=color value="{{ p.color }}"></div>
+  <label for=f-color>Accent color</label><input id=f-color type=color name=color value="{{ p.color }}">
+  <label for=f-img>Banner image URL (optional)</label><input id=f-img name=image_url type=url maxlength=500 value="{{ p.image_url or '' }}" placeholder="https://...">
+  <label for=f-foot>Footer text (optional)</label><input id=f-foot name=footer maxlength=200 value="{{ p.footer or '' }}"></div>
  <div class=panel><h2>Style</h2><p class=lead>How members {{ 'start an application' if p.kind == 'apply' else 'open a ticket' }}.</p>
   <div class=seg style="margin-top:14px">{% for v in styles_for %}<label><input type=radio name=style value="{{ v }}" {{ 'checked' if p.style == v }}><span>{{ names[v] }}</span></label>{% endfor %}</div>
+  <div data-for=button,menu,buttons><label>Button color</label><div class=seg>{% for v, l in bcolors %}<label><input type=radio name=button_color value="{{ v }}" {{ 'checked' if (p.button_color or bc_default) == v }}><span>{{ l }}</span></label>{% endfor %}</div></div>
   {% if p.kind == 'ticket' %}
   <label>Ticket types</label><div id=opts>{% for o in p.options %}<div class=qrow><input name=opt_label maxlength=80 placeholder="Label" aria-label="Label" value="{{ o.label }}"><input name=opt_desc maxlength=100 placeholder="Description (dropdown only)" aria-label="Description" value="{{ o.desc }}"><button type=button class=x aria-label="Remove type">&times;</button></div>{% endfor %}</div>
   <div class=split><span id=oc></span><button type=button id=addo class="btn ghost sm">Add ticket type</button></div>
@@ -551,10 +808,12 @@ async def panel_edit(gid, gname, pid):
   <label for=f-edesc>Description in multi panels</label><input id=f-edesc name=entry_desc maxlength=100 value="{{ p.entry_desc or '' }}" placeholder="Shown under the entry in a dropdown"></div>{% endif %}
  <div class=panel><h2>Publish</h2><p class=lead>Publishing sends the message, or updates it if it is already posted.</p>
   <label for=f-ch>Channel</label><select id=f-ch name=channel>{{ opts(text, p.channel_id) }}</select>
-  <p style="margin:22px 0 0;display:flex;gap:10px;flex-wrap:wrap"><button class="btn ghost" name=do value=save>Save</button><button class=btn name=do value=publish>Save and publish</button></p></div>
+  </div>
 </div>
 <div class="panel stick"><h2>Preview</h2><p class=lead>Updates as you type.</p><div class=dc id=pv data-kind="{{ p.kind }}" style="margin-top:18px"></div></div>
-</div></form>""", gname=gname, gid=gid, p=p, forms=forms, text=text, styles_for=STYLES[p["kind"]], names=STYLE_NAMES, cats=cats, roles=roles, tickets=tickets)
+</div>
+<div class=bar><span class=dirtymsg>Unsaved changes</span><button class="btn ghost" name=do value=save>Save</button><button class=btn name=do value=publish>Save and publish</button></div><div style="height:72px"></div></form>""", gname=gname, gid=gid, p=p, forms=forms, text=text, styles_for=STYLES[p["kind"]], names=STYLE_NAMES, cats=cats, roles=roles, tickets=tickets,
+                       bcolors=[("blurple", "Blurple"), ("gray", "Gray"), ("green", "Green"), ("red", "Red")], bc_default="green" if p["kind"] == "apply" else "blurple")
 
 @web.post("/g/<gid>/panel/save")
 @guild_route
@@ -574,9 +833,12 @@ async def panel_save(gid, gname):
     pick = lambda key, items: f.get(key) if f.get(key) in {c["id"] for c in items} else None
     channel = pick("channel", text)
     tcat, trole, tlog = (pick("ticket_category", cats), pick("support_role", roles), pick("ticket_log", text)) if kind == "ticket" else (None, None, None)
+    img = f.get("image_url", "").strip()[:500]; img = img if img.startswith("https://") else None
+    foot = f.get("footer", "").strip()[:200]
+    bcol = f.get("button_color") if f.get("button_color") in BS else None
     vals = ((f.get("name") or "").strip()[:60] or "Untitled panel", style, f.get("title", "").strip()[:200], f.get("description", "").strip()[:2000], color,
             f.get("button_label", "").strip()[:80], f.get("placeholder", "").strip()[:100], json.dumps(options), json.dumps(fids), channel,
-            tcat, trole, tlog, f.get("welcome", "").strip()[:1000], f.get("entry_desc", "").strip()[:100], json.dumps(members))
+            tcat, trole, tlog, f.get("welcome", "").strip()[:1000], f.get("entry_desc", "").strip()[:100], json.dumps(members), img, foot, bcol)
     pid = int(f["pid"]) if f.get("pid", "").isdigit() else None
     old = await db("SELECT * FROM panels WHERE id=$1 AND guild_id=$2", pid, gid, mode="fetchrow") if pid else None
     if pid and not old: abort(404)
@@ -585,11 +847,11 @@ async def panel_save(gid, gname):
             await dapi("DELETE", f"/channels/{old['channel_id']}/messages/{old['message_id']}")
             await db("UPDATE panels SET message_id=NULL WHERE id=$1", pid, mode="execute")
         await db("""UPDATE panels SET name=$1,style=$2,title=$3,description=$4,color=$5,button_label=$6,placeholder=$7,options=$8,forms=$9,channel_id=$10,
-                    ticket_category=$11,support_role=$12,ticket_log=$13,welcome=$14,entry_desc=$15,members=$16 WHERE id=$17 AND guild_id=$18""", *vals, pid, gid, mode="execute")
+                    ticket_category=$11,support_role=$12,ticket_log=$13,welcome=$14,entry_desc=$15,members=$16,image_url=$17,footer=$18,button_color=$19 WHERE id=$20 AND guild_id=$21""", *vals, pid, gid, mode="execute")
     else:
         pid = await db("""INSERT INTO panels(name,style,title,description,color,button_label,placeholder,options,forms,channel_id,
-                          ticket_category,support_role,ticket_log,welcome,entry_desc,members,guild_id,kind)
-                          VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18) RETURNING id""", *vals, gid, kind, mode="fetchval")
+                          ticket_category,support_role,ticket_log,welcome,entry_desc,members,image_url,footer,button_color,guild_id,kind)
+                          VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21) RETURNING id""", *vals, gid, kind, mode="fetchval")
     session["msg"] = await publish_panel(gid, pid) if f.get("do") == "publish" else "Panel saved."
     return redirect(f"/g/{gid}/panel/{pid}")
 
@@ -601,4 +863,15 @@ async def panel_delete(gid, gname, pid):
         if old["message_id"]: await dapi("DELETE", f"/channels/{old['channel_id']}/messages/{old['message_id']}")
         await db("DELETE FROM panels WHERE id=$1", old["id"], mode="execute")
         session["msg"] = "Panel deleted."
-    return redirect(f"/g/{gid}" + ("#apps" if old and old["kind"] == "apply" else ""))
+    return redirect(f"/g/{gid}" + ("#apps" if old and old["kind"] == "apply" else "#tickets"))
+
+@web.post("/g/<gid>/panel/<pid>/duplicate")
+@guild_route
+async def panel_duplicate(gid, gname, pid):
+    row = await db("SELECT id FROM panels WHERE id=$1 AND guild_id=$2", int(pid) if pid.isdigit() else 0, gid, mode="fetchrow")
+    if not row: abort(404)
+    new = await db("""INSERT INTO panels(guild_id,kind,name,style,title,description,color,button_label,placeholder,options,forms,ticket_category,support_role,ticket_log,welcome,entry_desc,members,image_url,footer,button_color)
+                      SELECT guild_id,kind,LEFT(name,52) || ' (copy)',style,title,description,color,button_label,placeholder,options,forms,ticket_category,support_role,ticket_log,welcome,entry_desc,members,image_url,footer,button_color
+                      FROM panels WHERE id=$1 RETURNING id""", row["id"], mode="fetchval")
+    session["msg"] = "Panel duplicated. It is not published yet."
+    return redirect(f"/g/{gid}/panel/{new}")
